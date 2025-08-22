@@ -1,5 +1,9 @@
 #!/bin/sh
 # zero — gerenciador de pacotes estilo KISS (POSIX sh)
+# Recursos: fetch, checksum, patch, strip, deps recursivas (c/ ciclo),
+# revdep evoluído (detecção + --fix), remove integrado ao revdep,
+# world (rebuild de todo o sistema), sync (git), upgrade (versão maior),
+# clean, update, mensagens coloridas.
 
 # ---------- Variáveis (podem ser sobrescritas via ambiente) ----------
 : "${ZERO_PATH:=$HOME/repos}"            # Repositórios (separe por :)
@@ -7,7 +11,7 @@
 : "${ZERO_CACHE:=/var/cache/zero}"       # Cache (sources, buildsrc, pkgdir, .tar.gz)
 : "${ZERO_STRIP:=yes}"                   # yes/no para strip de ELF
 : "${ZERO_FETCH_CMD:=auto}"              # auto|curl|wget
-: "${ZERO_VERSION:=0.2}"                 # versão do gerenciador
+: "${ZERO_VERSION:=0.3}"                 # versão do gerenciador
 umask 022
 
 # ---------- Cores ----------
@@ -81,7 +85,6 @@ while [ $# -gt 0 ]; do
         --force) FORCE=yes; shift ;;
         --) shift; break ;;
         -*)
-            # guarda global para comandos que aceitem flags depois
             GLOBAL_ARGS="$GLOBAL_ARGS $1"; shift ;;
         *) break ;;
     esac
@@ -185,18 +188,15 @@ write_meta_from_tar(){
     tar -tzf "$tarball" > "$ZERO_DB/$pkg/manifest" || die "manifest falhou"
     path=$(pkg_path "$pkg") || die "path pkg"
     cp -f "$path/version" "$ZERO_DB/$pkg/version" 2>/dev/null || printf "0\n" > "$ZERO_DB/$pkg/version"
-    cp -f "$path/depends" "$ZERO_DB/$pkg/depends" 2>/dev/null || : 
+    cp -f "$path/depends" "$ZERO_DB/$pkg/depends" 2>/dev/null || :
 }
-
-# ---------- Checagem de conflito de arquivos (tarball vs sistema instalado) ----------
+# ---------- Conflitos de arquivos (tarball vs sistema instalado) ----------
 tar_conflicts(){
     pkg=$1; tarball="$ZERO_CACHE/$pkg.tar.gz"
     [ -f "$tarball" ] || die "tarball não encontrado: $tarball"
     conflicts=""
-    # arquivos que seriam escritos que já pertencem a outro pacote
     while IFS= read -r f; do
         [ -z "$f" ] && continue
-        # se arquivo já existe e não é diretório, verificar proprietário (manifest de outro pacote)
         if [ -e "/$f" ]; then
             owner=""
             for d in "$ZERO_DB"/*; do
@@ -220,7 +220,6 @@ install_one(){
     pkg=$1
     tarball="$ZERO_CACHE/$pkg.tar.gz"
     [ -f "$tarball" ] || die "tarball não encontrado: $tarball (rode zero build $pkg)"
-    # conflitos?
     c=$(tar_conflicts "$pkg")
     if [ -n "$c" ] && [ "$FORCE" != "yes" ]; then
         err "conflitos de arquivos detectados ao instalar $pkg:"
@@ -233,7 +232,7 @@ install_one(){
     ok "$pkg instalado"
 }
 
-# ---------- Reverse deps simples (pelo banco instalado) ----------
+# ---------- Reverse deps (leitura simples do banco) ----------
 reverse_deps(){
     target=$1
     [ -d "$ZERO_DB" ] || return 0
@@ -244,11 +243,10 @@ reverse_deps(){
     done
 }
 
-# ---------- Remover (chama revdep/conflitos) ----------
+# ---------- Remover (revdep integrado) ----------
 remove_one(){
     pkg=$1
     [ -d "$ZERO_DB/$pkg" ] || die "$pkg não está instalado"
-    # checar reverse deps
     rdeps=$(reverse_deps "$pkg")
     if [ -n "$rdeps" ] && [ "$FORCE" != "yes" ]; then
         err "não é seguro remover $pkg; usado por: $rdeps"
@@ -261,6 +259,7 @@ remove_one(){
     rm -rf "$ZERO_DB/$pkg"
     ok "$pkg removido"
 }
+
 # ---------- Dependências ----------
 pkg_depends(){ _p=$1; _path=$(pkg_path "$_p") || return 1; read_lines "$_path/depends"; }
 
@@ -294,7 +293,6 @@ build_with_deps(){
     order=$(dep_resolve "$pkg") || exit 1
     info "ordem de build: $order"
     for p in $order; do
-        # se tarball já existir e não foi pedido --force, pula build
         if [ -f "$ZERO_CACHE/$p.tar.gz" ] && [ "$FORCE" != "yes" ]; then
             ok "cache presente: $p"
         else
@@ -313,7 +311,6 @@ install_with_deps(){
         install_one "$p"
     done
 }
-
 # ---------- checksum (gerar/atualizar) ----------
 cmd_checksum(){
     pkg=$1; [ -n "$pkg" ] || die "uso: zero checksum <pkg>"
@@ -362,10 +359,13 @@ cmd_clean(){
 }
 
 cmd_version(){ printf "zero %s\n" "$ZERO_VERSION"; }
+
 # ---------- revdep evoluído ----------
-# 1) revdep list <pkg>     — quem depende de <pkg>
-# 2) revdep check          — ELF quebrados (ldd "not found")
-# 3) revdep conflicts <pkg>— conflitos de arquivos (entre pacote alvo e instalados)
+# Usos:
+#   zero revdep list <pkg>
+#   zero revdep check
+#   zero revdep conflicts <pkg>
+#   zero revdep fix <pkg>     (equivalente a revdep --fix)
 cmd_revdep(){
     sub=$1
     case "$sub" in
@@ -397,10 +397,23 @@ cmd_revdep(){
             c=$(tar_conflicts "$p")
             if [ -n "$c" ]; then err "conflitos ao instalar $p:"; printf "%b\n" "$c"; exit 1; else ok "sem conflitos detectados"; fi
             ;;
-        *) die "uso: zero revdep {list <pkg>|check|conflicts <pkg>}" ;;
+        fix)
+            p=$2; [ -n "$p" ] || die "uso: zero revdep fix <pkg>"
+            info "corrigindo dependentes de $p (rebuild automático)"
+            # 1) listar dependentes diretos
+            r=$(reverse_deps "$p")
+            [ -n "$r" ] || { ok "nenhum dependente para corrigir"; return 0; }
+            # 2) para cada dependente, rebuild + reinstall (em ordem de deps)
+            for dep in $r; do
+                info "rebuild dependente: $dep"
+                build_with_deps "$dep"
+                install_with_deps "$dep"
+            done
+            ok "revdep fix concluído"
+            ;;
+        *) die "uso: zero revdep {list <pkg>|check|conflicts <pkg>|fix <pkg>}" ;;
     esac
 }
-
 # ---------- update (rebuild mantendo versão) ----------
 cmd_update(){
     pkg=$1; [ -n "$pkg" ] || die "uso: zero update <pkg>"
@@ -440,6 +453,9 @@ cmd_upgrade(){
     if ver_is_newer "$v_local" "$v_repo"; then
         info "upgrade $pkg: $v_local -> $v_repo"
         build_with_deps "$pkg"
+        # antes de instalar, tentar corrigir dependentes (se necessário)
+        # (não obrigatório, mas útil se a ABI muda)
+        cmd_revdep fix "$pkg"
         install_with_deps "$pkg"
     else
         ok "já na última versão ($v_local)"
@@ -449,26 +465,20 @@ cmd_upgrade(){
 # ---------- world (recompila/atualiza tudo na ordem de dependências) ----------
 cmd_world(){
     info "reconstruindo mundo (todos instalados) respeitando dependências"
-    # coleta todos os instalados
     pkgs=""
     for d in "$ZERO_DB"/*; do [ -d "$d" ] || continue; pkgs="$pkgs $(basename "$d")"; done
     [ -n "$pkgs" ] || { ok "nada instalado"; return 0; }
 
-    # construir um super-grafo e ordenar (ingênuo: resolver por pacote, concatenar e deduplicar)
     order=""
     for p in $pkgs; do order="$order $(dep_resolve "$p")"; done
-    # dedup preservando ordem
-    set -f
     order=$(printf "%s\n" $order | awk '!seen[$0]++')
     info "ordem de world:\n$order"
 
-    # construir + instalar cada um
     for p in $order; do
         build_one "$p"
         install_one "$p"
     done
 
-    # checar quebras
     cmd_revdep check || warn "há ELFs quebrados após world"
     ok "world concluído"
 }
@@ -485,14 +495,15 @@ Comandos:
   checksum <pkg>          Gerar/atualizar checksums de <pkg>
   build <pkg>             Build (resolve deps, patch, strip, empacota)
   install <pkg>           Instalar (resolve deps e instala em ordem)
-  remove <pkg>            Remover pacote (checa reverse-deps; usa --force p/ ignorar)
+  remove <pkg>            Remover pacote (checa reverse-deps; '--force' ignora)
   update <pkg>            Rebuild + reinstala <pkg> (mesma versão)
-  upgrade <pkg>           Atualiza apenas se houver versão maior no repo
-  world                   Reconstruir/atualizar todos os instalados (ordem de deps)
+  upgrade <pkg>           Atualiza somente se houver versão maior no repo
+  world                   Reconstruir/atualizar todos (ordem de deps)
   depgraph <pkg>          Imprime ordem topológica de <pkg> e suas deps
   revdep list <pkg>       Quem depende de <pkg>
-  revdep conflicts <pkg>  Conflitos de arquivos do tarball de <pkg> com instalados
+  revdep conflicts <pkg>  Conflitos de arquivos do tarball com instalados
   revdep check            ELF quebrados (ldd "not found")
+  revdep fix <pkg>        Corrige dependentes de <pkg> (rebuild automático)
   sync                    git pull em todos os repositórios do ZERO_PATH
   clean [pkg|all]         Limpa cache (de um pacote ou inteiro)
   version                 Versão do ZERO
@@ -508,7 +519,7 @@ Notas:
 - Patches ficam no diretório do pacote e devem constar em 'sources' (ordem aplicada).
 - Script 'build' do pacote recebe \$1=DESTDIR (use 'make DESTDIR="\$1" install').
 - 'depends' tem um nome de pacote por linha; dependências recursivas são resolvidas.
-- '--force' permite sobrescrever conflitos e ignorar reverse-deps em remove/install/upgrade.
+- '--force' permite ignorar reverse-deps e sobrescrever conflitos em remove/install/upgrade.
 EOF
 }
 
