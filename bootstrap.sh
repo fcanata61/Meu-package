@@ -71,10 +71,8 @@ export ZERO_DB="$ZERO_DB"
 export ZERO_CACHE="$ZERO_CACHE"
 export ZERO_TMP="$ZERO_TMP"
 export ZERO_COLOR=1
-
-# Repositórios padrão (adicione/remova conforme necessário)
-export ZERO_REPOS="/usr/local/zero/repos/core:/usr/local/zero/repos/meu-repo:/usr/local/zero/repos/outros"
-
+# Repositório do git do zero,por ordem
+export ZERO_REPOS="/usr/local/zero/repos/core:/usr/local/zero/repos/x11:/usr/local/zero/repos/desktop:/usr/local/zero/repos/extras"
 # PATH: adiciona binários do ZERO
 export PATH="$PREFIX/bin:\$PATH"
 EOF
