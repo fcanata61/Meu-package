@@ -1,60 +1,42 @@
 #!/bin/sh
-# zero - gerenciador de pacotes estilo KISS, POSIX sh
-# Recursos: fetch, checksum, patch, build, install, remove, list, search,
-# deps recursivas com ciclo, strip, revdep, mensagens coloridas.
+# zero — gerenciador de pacotes estilo KISS (POSIX sh)
 
-# ---------- Opções/variáveis (podem ser sobrescritas por ambiente) ----------
+# ---------- Variáveis (podem ser sobrescritas via ambiente) ----------
 : "${ZERO_PATH:=$HOME/repos}"            # Repositórios (separe por :)
 : "${ZERO_DB:=/var/db/zero/installed}"   # Banco de pacotes instalados
-: "${ZERO_CACHE:=/var/cache/zero}"       # Cache (sources, buildsrc, pkgdir)
-: "${ZERO_JOBS:=1}"                      # Futuro: paralelismo (não usado aqui)
-: "${ZERO_STRIP:=yes}"                   # yes/no para strip em ELF
+: "${ZERO_CACHE:=/var/cache/zero}"       # Cache (sources, buildsrc, pkgdir, .tar.gz)
+: "${ZERO_STRIP:=yes}"                   # yes/no para strip de ELF
 : "${ZERO_FETCH_CMD:=auto}"              # auto|curl|wget
+: "${ZERO_VERSION:=0.2}"                 # versão do gerenciador
 umask 022
 
 # ---------- Cores ----------
 if [ -t 1 ]; then
     ESC=$(printf '\033')
-    C_RESET="${ESC}[0m"
-    C_BOLD="${ESC}[1m"
-    C_RED="${ESC}[31m"
-    C_GRN="${ESC}[32m"
-    C_YLW="${ESC}[33m"
-    C_BLU="${ESC}[34m"
-    C_MAG="${ESC}[35m"
-    C_CYN="${ESC}[36m"
+    C_RESET="${ESC}[0m"; C_BOLD="${ESC}[1m"
+    C_RED="${ESC}[31m"; C_GRN="${ESC}[32m"; C_YLW="${ESC}[33m"
+    C_BLU="${ESC}[34m"; C_MAG="${ESC}[35m"; C_CYN="${ESC}[36m"
 else
-    C_RESET= C_BOLD= C_RED= C_GRN= C_YLW= C_BLU= C_MAG= C_CYN=
+    C_RESET=; C_BOLD=; C_RED=; C_GRN=; C_YLW=; C_BLU=; C_MAG=; C_CYN=
 fi
 
-msg() { printf "%s==>%s %s\n" "$C_BOLD$C_CYN" "$C_RESET" "$*"; }
-ok()  { printf "%s[ok]%s %s\n" "$C_GRN" "$C_RESET" "$*"; }
-wrn() { printf "%s[warn]%s %s\n" "$C_YLW" "$C_RESET" "$*"; }
-err() { printf "%s[err]%s %s\n" "$C_RED" "$C_RESET" "$*" >&2; }
-die() { err "$*"; exit 1; }
+info(){ printf "%s==>%s %s\n" "$C_BOLD$C_CYN" "$C_RESET" "$*"; }
+ok(){   printf "%s[ok]%s %s\n" "$C_GRN" "$C_RESET" "$*"; }
+warn(){ printf "%s[warn]%s %s\n" "$C_YLW" "$C_RESET" "$*"; }
+err(){  printf "%s[err]%s %s\n" "$C_RED" "$C_RESET" "$*" >&2; }
+die(){  err "$*"; exit 1; }
 
-# ---------- Checagens iniciais ----------
-need_bin() { command -v "$1" >/dev/null 2>&1 || die "comando requerido não encontrado: $1"; }
+need_bin(){ command -v "$1" >/dev/null 2>&1 || die "comando requerido não encontrado: $1"; }
 
-# fetcher auto
-fetch_file() {
-    url=$1 out=$2
-    case "$ZERO_FETCH_CMD" in
-        curl) need_bin curl; curl -L --fail --proto =https -o "$out" "$url" || return 1 ;;
-        wget) need_bin wget; wget -O "$out" "$url" || return 1 ;;
-        auto|*) if command -v curl >/dev/null 2>&1; then
-                    ZERO_FETCH_CMD=curl; fetch_file "$url" "$out"
-                elif command -v wget >/dev/null 2>&1; then
-                    ZERO_FETCH_CMD=wget; fetch_file "$url" "$out"
-                else
-                    die "precisa de curl ou wget para baixar: $url"
-                fi ;;
-    esac
-}
+# ---------- Pastas essenciais ----------
+ensure_dirs(){ mkdir -p "$ZERO_DB" "$ZERO_CACHE" || die "falha ao criar diretórios"; }
+ensure_dirs
 
-# ---------- Caminhos, busca de pacote ----------
-# percorre ZERO_PATH (sep por :) e retorna caminho do pacote
-pkg_path() {
+# ---------- Leitura de linhas (ignora vazias e comentários) ----------
+read_lines(){ [ -f "$1" ] || return 0; awk 'NF && $1 !~ /^#/' "$1"; }
+
+# ---------- Caminho do pacote em ZERO_PATH ----------
+pkg_path(){
     _name=$1
     OLDIFS=$IFS; IFS=:
     for repo in $ZERO_PATH; do
@@ -64,62 +46,72 @@ pkg_path() {
     return 1
 }
 
-ensure_dirs() {
-    mkdir -p "$ZERO_DB" || die "falha mkdir $ZERO_DB"
-    mkdir -p "$ZERO_CACHE" || die "falha mkdir $ZERO_CACHE"
+# ---------- Download ----------
+fetch_file(){
+    url=$1 out=$2
+    case "$ZERO_FETCH_CMD" in
+        curl) need_bin curl; curl -L --fail --proto =https -o "$out" "$url" || return 1 ;;
+        wget) need_bin wget; wget -O "$out" "$url" || return 1 ;;
+        auto|*) if command -v curl >/dev/null 2>&1; then ZERO_FETCH_CMD=curl; fetch_file "$url" "$out"
+                elif command -v wget >/dev/null 2>&1; then ZERO_FETCH_CMD=wget; fetch_file "$url" "$out"
+                else die "precisa de curl ou wget para baixar: $url"; fi ;;
+    esac
 }
-ensure_dirs
 
-# ---------- Helpers de leitura ----------
-read_lines() { # read_lines <file> → ecoa linhas não vazias/sem comentário
-    _f=$1
-    [ -f "$_f" ] || return 0
-    awk 'NF && $1 !~ /^#/' "$_f"
-}
-
-# ---------- ELF/strip ----------
-is_elf() { file -b "$1" 2>/dev/null | grep -q "ELF"; }
-do_strip_tree() {
-    [ "$ZERO_STRIP" = "yes" ] || { wrn "strip desabilitado (ZERO_STRIP=no)"; return 0; }
-    if ! command -v strip >/dev/null 2>&1; then wrn "strip ausente, pulando"; return 0; fi
+# ---------- ELF e strip ----------
+is_elf(){ file -b "$1" 2>/dev/null | grep -q "ELF"; }
+do_strip_tree(){
+    [ "$ZERO_STRIP" = "yes" ] || { warn "strip desabilitado (ZERO_STRIP=no)"; return 0; }
+    command -v strip >/dev/null 2>&1 || { warn "strip ausente, pulando"; return 0; }
     root=$1
-    msg "strip ELF em $root"
+    info "strip ELF em $root"
     find "$root" -type f -print | while IFS= read -r f; do
         if is_elf "$f"; then
-            # tentar preservar depuração mínima
             strip -s "$f" 2>/dev/null || strip "$f" 2>/dev/null || true
         fi
     done
     ok "strip concluído"
 }
-# ---------- Fetch, checksum, extract, patch ----------
-fetch_sources() {
+
+# ---------- Flags globais (ex.: --force) ----------
+FORCE=no
+GLOBAL_ARGS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force) FORCE=yes; shift ;;
+        --) shift; break ;;
+        -*)
+            # guarda global para comandos que aceitem flags depois
+            GLOBAL_ARGS="$GLOBAL_ARGS $1"; shift ;;
+        *) break ;;
+    esac
+done
+CMD=$1; shift 2>/dev/null || true
+# ---------- Fetch, checksum ----------
+fetch_sources(){
     pkg=$1; path=$2; cache="$ZERO_CACHE/$pkg/sources"
     mkdir -p "$cache" || die "mkdir $cache"
-    msg "baixando/copiano sources de $pkg"
+    info "baixando/copiano sources de $pkg"
     read_lines "$path/sources" | while IFS= read -r src; do
         case "$src" in
             http://*|https://*)
                 out="$cache/$(basename "$src")"
-                msg "baixa: $src"
-                fetch_file "$src" "$out" || die "falha ao baixar $src"
-                ;;
+                info "baixa $src"
+                fetch_file "$src" "$out" || die "falha ao baixar $src" ;;
             *)
                 [ -f "$path/$src" ] || die "arquivo local não existe: $path/$src"
-                msg "copia: $src"
-                cp -f "$path/$src" "$cache/" || die "falha copiar $src"
-                ;;
+                info "copia $src"
+                cp -f "$path/$src" "$cache/" || die "falha copiar $src" ;;
         esac
     done
     ok "sources prontos em $cache"
 }
 
-verify_checksums() {
+verify_checksums(){
     pkg=$1; path=$(pkg_path "$pkg") || die "sem path"
     cache="$ZERO_CACHE/$pkg/sources"
     [ -f "$path/checksums" ] || die "faltando checksums em $pkg"
-    msg "verificando checksums de $pkg"
-    # checksums: "sha256  filename"
+    info "verificando checksums de $pkg"
     ( cd "$cache" || exit 1
       while IFS= read -r sum file; do
           [ -z "$sum" ] && continue
@@ -129,14 +121,15 @@ verify_checksums() {
     ok "checksums válidos"
 }
 
-extract_and_patch() {
+# ---------- Extract + Patch ----------
+extract_and_patch(){
     pkg=$1
     path=$(pkg_path "$pkg") || die "sem path"
     cache="$ZERO_CACHE/$pkg/sources"
     buildsrc="$ZERO_CACHE/$pkg/buildsrc"
     rm -rf "$buildsrc" && mkdir -p "$buildsrc" || die "prep buildsrc"
 
-    msg "extraindo tarballs de $pkg"
+    info "extraindo tarballs de $pkg"
     for f in "$cache"/*; do
         case "$f" in
             *.tar.gz|*.tgz) tar -xzf "$f" -C "$buildsrc" || die "tar $f" ;;
@@ -146,11 +139,10 @@ extract_and_patch() {
         esac
     done
 
-    # diretório raiz do source (primeiro nível)
     srcdir=$(find "$buildsrc" -mindepth 1 -maxdepth 1 -type d | head -n1)
     [ -n "$srcdir" ] || die "não foi possível detectar diretório do source"
 
-    msg "aplicando patches (ordem de sources)"
+    info "aplicando patches (ordem do arquivo sources)"
     read_lines "$path/sources" | while IFS= read -r src; do
         case "$src" in
             *.patch|*.diff)
@@ -161,15 +153,14 @@ extract_and_patch() {
                 ;;
         esac
     done
-
     printf %s "$srcdir"
 }
 
-# ---------- Build (um pacote) ----------
-build_one() {
+# ---------- Build de um pacote ----------
+build_one(){
     pkg=$1
     path=$(pkg_path "$pkg") || die "pacote $pkg não encontrado em ZERO_PATH"
-    msg "build de $pkg"
+    info "build de $pkg"
 
     fetch_sources "$pkg" "$path"
     verify_checksums "$pkg"
@@ -178,130 +169,179 @@ build_one() {
     DESTDIR="$ZERO_CACHE/$pkg/pkgdir"
     rm -rf "$DESTDIR" && mkdir -p "$DESTDIR" || die "prep DESTDIR"
 
-    # executa script build do pacote com $1 = DESTDIR
     [ -x "$path/build" ] || chmod +x "$path/build" 2>/dev/null || true
     ( cd "$srcdir" && sh "$path/build" "$DESTDIR" ) || die "build falhou ($pkg)"
 
     do_strip_tree "$DESTDIR"
 
-    # empacotar
     ( cd "$DESTDIR" && tar -czf "$ZERO_CACHE/$pkg.tar.gz" . ) || die "empacotar falhou"
     ok "pacote pronto: $ZERO_CACHE/$pkg.tar.gz"
 }
-# ---------- Dependências ----------
-# Lê depends de um pacote (uma por linha)
-pkg_depends() {
-    _p=$1; _path=$(pkg_path "$_p") || return 1
-    read_lines "$_path/depends"
-}
 
-# Resolve dependências recursivamente e retorna ordem topológica
-# detecta ciclo e aborta
-dep_resolve() {
-    # uso: dep_resolve <pkg>  → ecoa lista na ordem correta
-    target=$1
-    VISITED_TMP="$(mktemp -t zero.visited.XXXXXX)" || exit 1
-    STACK_TMP="$(mktemp -t zero.stack.XXXXXX)" || exit 1
-    ORDER_TMP="$(mktemp -t zero.order.XXXXXX)" || exit 1
-
-    touch "$VISITED_TMP" "$STACK_TMP" "$ORDER_TMP"
-
-    _dfs() {
-        node=$1
-        echo "$node" | grep -qxF "$(cat "$VISITED_TMP")" 2>/dev/null && return 0
-        echo "$node" >>"$VISITED_TMP"
-        echo "$node" >>"$STACK_TMP"
-
-        for d in $(pkg_depends "$node"); do
-            [ -z "$d" ] && continue
-            # se não existe pacote, erro
-            pkg_path "$d" >/dev/null 2>&1 || die "dependência ausente: $d (requerida por $node)"
-            # ciclo?
-            if grep -qxF "$d" "$STACK_TMP"; then
-                die "ciclo de dependências detectado: $node -> $d"
-            fi
-            # já visitado?
-            if ! grep -qxF "$d" "$VISITED_TMP"; then
-                _dfs "$d"
-            fi
-        done
-
-        # pop stack e adiciona na ordem
-        # remove última ocorrência de $node do STACK_TMP
-        tmp="$(mktemp)"
-        grep -vxF "$node" "$STACK_TMP" > "$tmp" && mv "$tmp" "$STACK_TMP"
-        echo "$node" >>"$ORDER_TMP"
-    }
-
-    _dfs "$target"
-
-    cat "$ORDER_TMP" | awk '!seen[$0]++'
-
-    rm -f "$VISITED_TMP" "$STACK_TMP" "$ORDER_TMP"
-}
-
-# ---------- Install ----------
-install_one() {
-    pkg=$1
-    tarball="$ZERO_CACHE/$pkg.tar.gz"
-    [ -f "$tarball" ] || die "tarball não encontrado: $tarball (rode zero build $pkg)"
-    msg "instalando $pkg"
+# ---------- Manifesto e metadados ----------
+write_meta_from_tar(){
+    pkg=$1; tarball="$ZERO_CACHE/$pkg.tar.gz"
     mkdir -p "$ZERO_DB/$pkg" || die "mkdir db $pkg"
-    # extrair e capturar manifest
-    TMPROOT="$(mktemp -d -t zero.root.XXXXXX)" || exit 1
-    tar -xzf "$tarball" -C / || { rm -rf "$TMPROOT"; die "falha ao extrair no /"; }
-
-    # gerar manifest a partir do tarball (conteúdo, com path relativo)
     tar -tzf "$tarball" > "$ZERO_DB/$pkg/manifest" || die "manifest falhou"
     path=$(pkg_path "$pkg") || die "path pkg"
     cp -f "$path/version" "$ZERO_DB/$pkg/version" 2>/dev/null || printf "0\n" > "$ZERO_DB/$pkg/version"
     cp -f "$path/depends" "$ZERO_DB/$pkg/depends" 2>/dev/null || : 
+}
+
+# ---------- Checagem de conflito de arquivos (tarball vs sistema instalado) ----------
+tar_conflicts(){
+    pkg=$1; tarball="$ZERO_CACHE/$pkg.tar.gz"
+    [ -f "$tarball" ] || die "tarball não encontrado: $tarball"
+    conflicts=""
+    # arquivos que seriam escritos que já pertencem a outro pacote
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        # se arquivo já existe e não é diretório, verificar proprietário (manifest de outro pacote)
+        if [ -e "/$f" ]; then
+            owner=""
+            for d in "$ZERO_DB"/*; do
+                [ -d "$d" ] || continue
+                if grep -qxF "$f" "$d/manifest" 2>/dev/null; then
+                    base=$(basename "$d"); owner="$base"; break
+                fi
+            done
+            if [ -n "$owner" ] && [ "$owner" != "$pkg" ]; then
+                conflicts="$conflicts\n/$f  (pertence a: $owner)"
+            fi
+        fi
+    done <<EOF
+$(tar -tzf "$tarball")
+EOF
+    [ -n "$conflicts" ] && printf "%b" "$conflicts" || return 0
+}
+
+# ---------- Instalar ----------
+install_one(){
+    pkg=$1
+    tarball="$ZERO_CACHE/$pkg.tar.gz"
+    [ -f "$tarball" ] || die "tarball não encontrado: $tarball (rode zero build $pkg)"
+    # conflitos?
+    c=$(tar_conflicts "$pkg")
+    if [ -n "$c" ] && [ "$FORCE" != "yes" ]; then
+        err "conflitos de arquivos detectados ao instalar $pkg:"
+        printf "%b\n" "$c"
+        die "use --force para sobrescrever"
+    fi
+    info "instalando $pkg"
+    tar -xzf "$tarball" -C / || die "falha ao extrair no /"
+    write_meta_from_tar "$pkg"
     ok "$pkg instalado"
 }
 
-install_with_deps() {
+# ---------- Reverse deps simples (pelo banco instalado) ----------
+reverse_deps(){
+    target=$1
+    [ -d "$ZERO_DB" ] || return 0
+    for p in "$ZERO_DB"/*; do
+        [ -d "$p" ] || continue
+        base=$(basename "$p")
+        grep -qxF "$target" "$p/depends" 2>/dev/null && printf "%s " "$base"
+    done
+}
+
+# ---------- Remover (chama revdep/conflitos) ----------
+remove_one(){
     pkg=$1
-    msg "resolvendo dependências de $pkg"
+    [ -d "$ZERO_DB/$pkg" ] || die "$pkg não está instalado"
+    # checar reverse deps
+    rdeps=$(reverse_deps "$pkg")
+    if [ -n "$rdeps" ] && [ "$FORCE" != "yes" ]; then
+        err "não é seguro remover $pkg; usado por: $rdeps"
+        die "use --force para remover mesmo assim"
+    fi
+    info "removendo $pkg"
+    manifest="$ZERO_DB/$pkg/manifest"
+    [ -f "$manifest" ] || die "manifest ausente de $pkg"
+    tac "$manifest" 2>/dev/null | while IFS= read -r f; do rm -f "/$f" 2>/dev/null || true; done
+    rm -rf "$ZERO_DB/$pkg"
+    ok "$pkg removido"
+}
+# ---------- Dependências ----------
+pkg_depends(){ _p=$1; _path=$(pkg_path "$_p") || return 1; read_lines "$_path/depends"; }
+
+dep_resolve(){ # imprime ordem topológica (deps antes do alvo), detecta ciclo
+    target=$1
+    VIS="$(mktemp -t zero.vis.XXXXXX)" || exit 1
+    STK="$(mktemp -t zero.stk.XXXXXX)" || exit 1
+    ORD="$(mktemp -t zero.ord.XXXXXX)" || exit 1
+    touch "$VIS" "$STK" "$ORD"
+    _dfs(){ n=$1
+        grep -qxF "$n" "$VIS" 2>/dev/null && return 0
+        echo "$n" >>"$VIS"; echo "$n" >>"$STK"
+        for d in $(pkg_depends "$n"); do
+            [ -z "$d" ] && continue
+            pkg_path "$d" >/dev/null 2>&1 || die "dependência ausente: $d (requerida por $n)"
+            if grep -qxF "$d" "$STK"; then die "ciclo de dependências: $n -> $d"; fi
+            grep -qxF "$d" "$VIS" || _dfs "$d"
+        done
+        tmp="$(mktemp)"; grep -vxF "$n" "$STK" > "$tmp"; mv "$tmp" "$STK"
+        echo "$n" >>"$ORD"
+    }
+    _dfs "$target"
+    awk '!seen[$0]++' "$ORD"
+    rm -f "$VIS" "$STK" "$ORD"
+}
+
+# ---------- Build/Install com dependências ----------
+build_with_deps(){
+    pkg=$1
+    info "resolvendo dependências de build para $pkg"
     order=$(dep_resolve "$pkg") || exit 1
-    msg "ordem de build/install: $order"
+    info "ordem de build: $order"
+    for p in $order; do
+        # se tarball já existir e não foi pedido --force, pula build
+        if [ -f "$ZERO_CACHE/$p.tar.gz" ] && [ "$FORCE" != "yes" ]; then
+            ok "cache presente: $p"
+        else
+            build_one "$p"
+        fi
+    done
+}
+
+install_with_deps(){
+    pkg=$1
+    info "resolvendo dependências de instalação para $pkg"
+    order=$(dep_resolve "$pkg") || exit 1
+    info "ordem de instalação: $order"
     for p in $order; do
         [ -f "$ZERO_CACHE/$p.tar.gz" ] || build_one "$p"
         install_one "$p"
     done
 }
 
-# ---------- Remove ----------
-remove_one() {
-    pkg=$1
-    msg "removendo $pkg"
-    [ -d "$ZERO_DB/$pkg" ] || die "$pkg não está instalado"
-    # checar reverse deps que dependem de $pkg
-    rdeps=$(reverse_deps "$pkg")
-    if [ -n "$rdeps" ]; then
-        wrn "removendo $pkg, mas estes pacotes dependem dele:"
-        printf "  %s\n" $rdeps
-    fi
-    manifest="$ZERO_DB/$pkg/manifest"
-    [ -f "$manifest" ] || die "manifest ausente de $pkg"
-    # remover arquivos listados
-    # (remover diretórios vazios depois)
-    tac "$manifest" 2>/dev/null | while IFS= read -r f; do
-        rm -f "/$f" 2>/dev/null || true
+# ---------- checksum (gerar/atualizar) ----------
+cmd_checksum(){
+    pkg=$1; [ -n "$pkg" ] || die "uso: zero checksum <pkg>"
+    path=$(pkg_path "$pkg") || die "pacote não encontrado"
+    cache="$ZERO_CACHE/$pkg/sources"; mkdir -p "$cache" || die "mkcache"
+    info "preparando sources para checksums de $pkg"
+    fetch_sources "$pkg" "$path"
+    out="$path/checksums"; : > "$out"
+    read_lines "$path/sources" | while IFS= read -r src; do
+        f="$cache/$(basename "$src")"; [ -f "$f" ] || die "source ausente p/ checksum: $f"
+        s=$(sha256sum "$f" | awk '{print $1}'); printf "%s  %s\n" "$s" "$(basename "$f")" >> "$out"
     done
-    # limpar diretórios vazios de /usr, /etc, etc? (opcional)
-    rm -rf "$ZERO_DB/$pkg"
-    ok "$pkg removido"
+    ok "checksums atualizados em $out"
 }
 
-# ---------- List/Search ----------
-cmd_list() {
-    msg "pacotes instalados em $ZERO_DB"
-    ls -1 "$ZERO_DB" 2>/dev/null || true
+# ---------- list/search/clean/version ----------
+cmd_list(){
+    info "instalados em $ZERO_DB"
+    for d in "$ZERO_DB"/*; do
+        [ -d "$d" ] || continue
+        p=$(basename "$d"); v=$(cat "$d/version" 2>/dev/null || printf "0")
+        printf "%s %s\n" "$p" "$v"
+    done
 }
-cmd_search() {
-    needle=$1
-    [ -n "$needle" ] || die "uso: zero search <nome>"
-    msg "procurando $needle em ZERO_PATH"
+
+cmd_search(){
+    needle=$1; [ -n "$needle" ] || die "uso: zero search <nome>"
+    info "procurando '$needle' em ZERO_PATH"
     OLDIFS=$IFS; IFS=:
     for repo in $ZERO_PATH; do
         for p in "$repo"/*; do
@@ -313,36 +353,35 @@ cmd_search() {
     IFS=$OLDIFS
 }
 
-# ---------- Reverse deps (quem depende de X) ----------
-reverse_deps() {
-    target=$1
-    [ -d "$ZERO_DB" ] || return 0
-    for p in "$ZERO_DB"/*; do
-        [ -d "$p" ] || continue
-        base=$(basename "$p")
-        grep -qxF "$target" "$p/depends" 2>/dev/null && printf "%s " "$base"
-    done
+cmd_clean(){
+    what=$1
+    case "$what" in
+        all|"") info "limpando cache $ZERO_CACHE"; rm -rf "$ZERO_CACHE"/* 2>/dev/null || true; ok "cache limpo" ;;
+        *) info "limpando cache de $what"; rm -rf "$ZERO_CACHE/$what" "$ZERO_CACHE/$what.tar.gz" 2>/dev/null || true; ok "limpo $what" ;;
+    esac
 }
 
-cmd_revdep() {
-    # Modo 1: lista reverse deps de um pacote (leitura de depends instalados)
-    # Modo 2: verificação de libs ausentes (revdep-rebuild simples)
-    case "$1" in
+cmd_version(){ printf "zero %s\n" "$ZERO_VERSION"; }
+# ---------- revdep evoluído ----------
+# 1) revdep list <pkg>     — quem depende de <pkg>
+# 2) revdep check          — ELF quebrados (ldd "not found")
+# 3) revdep conflicts <pkg>— conflitos de arquivos (entre pacote alvo e instalados)
+cmd_revdep(){
+    sub=$1
+    case "$sub" in
         list)
-            [ -n "$2" ] || die "uso: zero revdep list <pkg>"
-            r=$(reverse_deps "$2")
-            [ -n "$r" ] && { msg "reverse deps de $2:"; printf "%s\n" "$r"; } || ok "sem reverse deps"
+            p=$2; [ -n "$p" ] || die "uso: zero revdep list <pkg>"
+            r=$(reverse_deps "$p")
+            if [ -n "$r" ]; then info "reverse deps de $p:"; printf "%s\n" "$r"; else ok "sem reverse deps"; fi
             ;;
         check)
             need_bin ldd
-            msg "checando bins/libs quebrados (ldd not found)"
-            # Varre todos os manifestos, testa arquivos ELF
+            info "checando bins/libs quebrados (ldd 'not found')"
             broken=""
             for d in "$ZERO_DB"/*; do
                 [ -d "$d" ] || continue
                 while IFS= read -r f; do
-                    abs="/$f"
-                    [ -f "$abs" ] || continue
+                    abs="/$f"; [ -f "$abs" ] || continue
                     if is_elf "$abs"; then
                         if ldd "$abs" 2>/dev/null | grep -q "not found"; then
                             broken="$broken\n$abs"
@@ -350,62 +389,113 @@ cmd_revdep() {
                     fi
                 done < "$d/manifest"
             done
-            if [ -n "$broken" ]; then
-                err "arquivos ELF com dependências ausentes:"
-                printf "%b\n" "$broken"
-                exit 1
-            else
-                ok "nenhum ELF quebrado encontrado"
-            fi
+            if [ -n "$broken" ]; then err "ELFs com libs ausentes:"; printf "%b\n" "$broken"; exit 1; else ok "nenhum ELF quebrado"; fi
             ;;
-        *)
-            die "uso: zero revdep {list <pkg>|check}"
+        conflicts)
+            p=$2; [ -n "$p" ] || die "uso: zero revdep conflicts <pkg>"
+            t="$ZERO_CACHE/$p.tar.gz"; [ -f "$t" ] || die "tarball ausente (rode zero build $p)"
+            c=$(tar_conflicts "$p")
+            if [ -n "$c" ]; then err "conflitos ao instalar $p:"; printf "%b\n" "$c"; exit 1; else ok "sem conflitos detectados"; fi
             ;;
+        *) die "uso: zero revdep {list <pkg>|check|conflicts <pkg>}" ;;
     esac
 }
-# ---------- Comando checksums (gerar/atualizar) ----------
-cmd_checksum() {
-    pkg=$1
-    [ -n "$pkg" ] || die "uso: zero checksum <pkg>"
-    path=$(pkg_path "$pkg") || die "pacote não encontrado"
-    cache="$ZERO_CACHE/$pkg/sources"
-    mkdir -p "$cache" || die "mkcache"
-    msg "preparando sources para calcular checksums de $pkg"
-    # baixar/copiar para garantir presença local
-    fetch_sources "$pkg" "$path"
-    # gerar checksums (sha256) na ordem de sources
-    out="$path/checksums"
-    : > "$out"
-    read_lines "$path/sources" | while IFS= read -r src; do
-        f="$cache/$(basename "$src")"
-        [ -f "$f" ] || die "source ausente p/ checksum: $f"
-        s=$(sha256sum "$f" | awk '{print $1}')
-        printf "%s  %s\n" "$s" "$(basename "$f")" >> "$out"
-    done
-    ok "checksums atualizados em $out"
+
+# ---------- update (rebuild mantendo versão) ----------
+cmd_update(){
+    pkg=$1; [ -n "$pkg" ] || die "uso: zero update <pkg>"
+    build_with_deps "$pkg"
+    install_with_deps "$pkg"
 }
 
-# ---------- Comandos públicos ----------
-cmd_build()   { [ -n "$1" ] || die "uso: zero build <pkg>"; build_one "$1"; }
-cmd_install() { [ -n "$1" ] || die "uso: zero install <pkg>"; install_with_deps "$1"; }
-cmd_remove()  { [ -n "$1" ] || die "uso: zero remove <pkg>"; remove_one "$1"; }
-cmd_depgraph(){ [ -n "$1" ] || die "uso: zero depgraph <pkg>"; dep_resolve "$1"; }
+# ---------- sync (git pull em todos os repositórios) ----------
+cmd_sync(){
+    info "sincronizando repositórios em ZERO_PATH"
+    OLDIFS=$IFS; IFS=:
+    for repo in $ZERO_PATH; do
+        if [ -d "$repo/.git" ]; then
+            info "git pull: $repo"
+            git -C "$repo" pull --ff-only || die "git pull falhou em $repo"
+        else
+            warn "não é repositório git: $repo"
+        fi
+    done
+    IFS=$OLDIFS
+    ok "sync concluído"
+}
 
-# ---------- Ajuda ----------
-usage() {
+# ---------- upgrade (instalar apenas se houver versão maior) ----------
+ver_of_pkg_in_repo(){ path=$(pkg_path "$1") || return 1; cat "$path/version" 2>/dev/null || printf "0"; }
+ver_installed(){ cat "$ZERO_DB/$1/version" 2>/dev/null || printf "0"; }
+ver_is_newer(){  # retorna 0 se v2 > v1 (usa sort -V)
+    v1=$1; v2=$2
+    newest=$(printf "%s\n%s\n" "$v1" "$v2" | sort -V | tail -n1)
+    [ "$newest" = "$v2" ] && [ "$v1" != "$v2" ]
+}
+
+cmd_upgrade(){
+    pkg=$1; [ -n "$pkg" ] || die "uso: zero upgrade <pkg>"
+    v_local=$(ver_installed "$pkg")
+    v_repo=$(ver_of_pkg_in_repo "$pkg") || die "pacote não encontrado no repo"
+    if ver_is_newer "$v_local" "$v_repo"; then
+        info "upgrade $pkg: $v_local -> $v_repo"
+        build_with_deps "$pkg"
+        install_with_deps "$pkg"
+    else
+        ok "já na última versão ($v_local)"
+    fi
+}
+
+# ---------- world (recompila/atualiza tudo na ordem de dependências) ----------
+cmd_world(){
+    info "reconstruindo mundo (todos instalados) respeitando dependências"
+    # coleta todos os instalados
+    pkgs=""
+    for d in "$ZERO_DB"/*; do [ -d "$d" ] || continue; pkgs="$pkgs $(basename "$d")"; done
+    [ -n "$pkgs" ] || { ok "nada instalado"; return 0; }
+
+    # construir um super-grafo e ordenar (ingênuo: resolver por pacote, concatenar e deduplicar)
+    order=""
+    for p in $pkgs; do order="$order $(dep_resolve "$p")"; done
+    # dedup preservando ordem
+    set -f
+    order=$(printf "%s\n" $order | awk '!seen[$0]++')
+    info "ordem de world:\n$order"
+
+    # construir + instalar cada um
+    for p in $order; do
+        build_one "$p"
+        install_one "$p"
+    done
+
+    # checar quebras
+    cmd_revdep check || warn "há ELFs quebrados após world"
+    ok "world concluído"
+}
+usage(){
 cat <<EOF
-${C_BOLD}zero${C_RESET} - gerenciador de pacotes estilo KISS
+${C_BOLD}zero${C_RESET} v$ZERO_VERSION — gerenciador de pacotes estilo KISS
 
-Uso:
-  zero search <nome>           # procurar pacote(s) em ZERO_PATH
-  zero list                    # listar instalados
-  zero checksum <pkg>          # gerar/atualizar checksums do pacote
-  zero build <pkg>             # build (fetch+checksum+patch+empacota)
-  zero install <pkg>           # resolver deps e instalar em ordem
-  zero remove <pkg>            # remover pacote
-  zero depgraph <pkg>          # imprimir ordem de deps (topológica)
-  zero revdep list <pkg>       # quem depende de <pkg>
-  zero revdep check            # checar ELF quebrados (ldd "not found")
+Uso geral:
+  zero [--force] <comando> [args]
+
+Comandos:
+  search <nome>           Procurar pacotes em ZERO_PATH
+  list                    Listar pacotes instalados
+  checksum <pkg>          Gerar/atualizar checksums de <pkg>
+  build <pkg>             Build (resolve deps, patch, strip, empacota)
+  install <pkg>           Instalar (resolve deps e instala em ordem)
+  remove <pkg>            Remover pacote (checa reverse-deps; usa --force p/ ignorar)
+  update <pkg>            Rebuild + reinstala <pkg> (mesma versão)
+  upgrade <pkg>           Atualiza apenas se houver versão maior no repo
+  world                   Reconstruir/atualizar todos os instalados (ordem de deps)
+  depgraph <pkg>          Imprime ordem topológica de <pkg> e suas deps
+  revdep list <pkg>       Quem depende de <pkg>
+  revdep conflicts <pkg>  Conflitos de arquivos do tarball de <pkg> com instalados
+  revdep check            ELF quebrados (ldd "not found")
+  sync                    git pull em todos os repositórios do ZERO_PATH
+  clean [pkg|all]         Limpa cache (de um pacote ou inteiro)
+  version                 Versão do ZERO
 
 Ambiente:
   ZERO_PATH   (padrão: $HOME/repos)              # repositórios (sep por :)
@@ -415,23 +505,29 @@ Ambiente:
   ZERO_FETCH_CMD (auto|curl|wget, padrão auto)
 
 Notas:
-- Patches devem ficar no mesmo diretório do pacote e ser listados em 'sources'.
-- O script 'build' do pacote recebe ${C_BOLD}\$1${C_RESET} = DESTDIR.
-- 'depends' tem um nome de pacote por linha; deps recursivas são resolvidas.
+- Patches ficam no diretório do pacote e devem constar em 'sources' (ordem aplicada).
+- Script 'build' do pacote recebe \$1=DESTDIR (use 'make DESTDIR="\$1" install').
+- 'depends' tem um nome de pacote por linha; dependências recursivas são resolvidas.
+- '--force' permite sobrescrever conflitos e ignorar reverse-deps em remove/install/upgrade.
 EOF
 }
 
 # ---------- Router ----------
-cmd=$1; shift 2>/dev/null || true
-case "$cmd" in
-    search)   cmd_search "$@" ;;
-    list)     cmd_list ;;
-    checksum) cmd_checksum "$@" ;;
-    build)    cmd_build "$@" ;;
-    install)  cmd_install "$@" ;;
-    remove)   cmd_remove "$@" ;;
-    depgraph) cmd_depgraph "$@" ;;
-    revdep)   cmd_revdep "$@" ;;
-    ""|help|-h|--help) usage ;;
-    *) die "comando desconhecido: $cmd (use 'zero help')" ;;
+case "$CMD" in
+    search)    cmd_search "$@" ;;
+    list)      cmd_list ;;
+    checksum)  cmd_checksum "$@" ;;
+    build)     build_with_deps "$@" ;;
+    install)   install_with_deps "$@" ;;
+    remove)    remove_one "$@" ;;
+    update)    cmd_update "$@" ;;
+    upgrade)   cmd_upgrade "$@" ;;
+    world)     cmd_world "$@" ;;
+    depgraph)  dep_resolve "$@" ;;
+    revdep)    cmd_revdep "$@" ;;
+    sync)      cmd_sync "$@" ;;
+    clean)     cmd_clean "$@" ;;
+    version)   cmd_version ;;
+    ""|-h|--help|help) usage ;;
+    *) die "comando desconhecido: $CMD (use 'zero help')" ;;
 esac
