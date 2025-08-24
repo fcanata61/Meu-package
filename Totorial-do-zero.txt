@@ -1,0 +1,187 @@
+# =====================================================
+# Tutorial do Zero — Gerenciador de Pacotes estilo KISS
+# =====================================================
+
+O **zero** é um gerenciador de pacotes minimalista escrito em shell POSIX,
+inspirado no KISS Linux, com suporte a dependências recursivas, rebuild
+automático de dependentes (revdep), strip, sync via git, cache, upgrade,
+world rebuild, entre outros.
+
+Este documento cobre:
+1. Instalação do zero
+2. Estrutura de diretórios
+3. Arquivos de receita
+4. Variáveis de configuração
+5. Principais comandos
+6. Exemplo: receita do GCC
+
+-----------------------------------------------------
+1) INSTALAÇÃO DO ZERO
+-----------------------------------------------------
+
+1. Obtenha o script "zero" e torne-o executável:
+    git clone https://exemplo.com/repos/zero.git
+    cd zero
+    chmod +x zero
+    sudo cp zero /usr/bin/
+
+2. Verifique se funciona:
+    zero version
+    # Saída esperada: zero 0.3
+
+-----------------------------------------------------
+2) ESTRUTURA DE DIRETÓRIOS
+-----------------------------------------------------
+
+O zero utiliza 3 diretórios principais:
+
+- ZERO_PATH   (padrão: $HOME/repos)
+  Onde ficam os repositórios de pacotes, cada pacote é uma pasta com receita.
+  Exemplo:
+    $HOME/repos/core/gcc/
+    $HOME/repos/core/musl/
+    $HOME/repos/extra/...
+
+- ZERO_DB     (padrão: /var/db/zero/installed)
+  Banco de dados de pacotes instalados. Cada pacote tem:
+    /var/db/zero/installed/<nome>/manifest
+    /var/db/zero/installed/<nome>/version
+    /var/db/zero/installed/<nome>/depends
+
+- ZERO_CACHE  (padrão: /var/cache/zero)
+  Cache temporário com:
+    - sources/   (arquivos baixados ou copiados)
+    - buildsrc/  (source extraído)
+    - pkgdir/    (DESTDIR da instalação)
+    - tar.gz     (pacote final para instalar)
+
+Criação das pastas:
+    sudo mkdir -p /var/db/zero/installed
+    sudo mkdir -p /var/cache/zero
+    mkdir -p $HOME/repos/core
+
+-----------------------------------------------------
+3) RECEITA DE UM PACOTE
+-----------------------------------------------------
+
+Um pacote no zero é apenas um diretório contendo:
+
+- build       (script de build, shell executável)
+- version     (string da versão, ex: "14.2.0")
+- sources     (lista de URLs e/ou arquivos locais, um por linha)
+- checksums   (gerado por "zero checksum <pkg>")
+- depends     (nomes de pacotes dependentes, um por linha, opcional)
+- patches     (opcional, listados em sources, aplicados em ordem)
+
+Exemplo de estrutura:
+    gcc/
+      build
+      version
+      sources
+      checksums
+      depends
+
+-----------------------------------------------------
+4) VARIÁVEIS DE CONFIGURAÇÃO
+-----------------------------------------------------
+
+As variáveis podem ser sobrescritas no ambiente:
+
+- ZERO_PATH     Repositórios (separados por :)
+- ZERO_DB       Banco de dados de pacotes instalados
+- ZERO_CACHE    Diretório de cache
+- ZERO_STRIP    yes|no para strip de ELF (default yes)
+- ZERO_FETCH_CMD auto|curl|wget (default auto)
+
+Exemplo:
+    export ZERO_PATH=$HOME/repos/core:$HOME/repos/extra
+    export ZERO_STRIP=no
+
+-----------------------------------------------------
+5) COMANDOS DO ZERO
+-----------------------------------------------------
+
+Uso geral:
+    zero [--force] <comando> [args]
+
+Comandos principais:
+  search <nome>         Procurar pacotes em ZERO_PATH
+  list                  Listar pacotes instalados
+  checksum <pkg>        Gerar/atualizar checksums
+  build <pkg>           Build (resolve deps, patch, strip, empacota)
+  install <pkg>         Instalar (resolve deps)
+  remove <pkg>          Remover (checando reverse-deps)
+  update <pkg>          Rebuild + reinstala
+  upgrade <pkg>         Só instala se versão maior disponível
+  world                 Rebuild/atualiza tudo
+  depgraph <pkg>        Ordem topológica de dependências
+  revdep ...            Funções de reverse deps (list, check, fix)
+  sync                  git pull em todos os repositórios
+  clean [pkg|all]       Limpa cache
+  version               Mostra versão
+
+-----------------------------------------------------
+6) EXEMPLO DE RECEITA: GCC
+-----------------------------------------------------
+
+Criar pasta do pacote:
+    mkdir -p $HOME/repos/core/gcc
+    cd $HOME/repos/core/gcc
+
+Arquivo: version
+----------------
+14.2.0
+
+Arquivo: sources
+----------------
+https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+
+Arquivo: depends
+----------------
+musl
+binutils
+gmp
+mpfr
+mpc
+
+Arquivo: build
+---------------
+#!/bin/sh
+# $1 é DESTDIR
+
+./configure \
+  --prefix=/usr \
+  --disable-multilib \
+  --enable-languages=c,c++ \
+  --disable-bootstrap
+
+make -j$(nproc)
+make DESTDIR="$1" install
+
+Arquivo: checksums
+------------------
+# Gerado por:
+    zero checksum gcc
+
+-----------------------------------------------------
+7) USO
+-----------------------------------------------------
+
+Build e instalação do GCC:
+    zero build gcc
+    sudo zero install gcc
+
+Listar pacotes instalados:
+    zero list
+
+Remover:
+    sudo zero remove gcc
+
+Atualizar:
+    zero upgrade gcc
+
+-----------------------------------------------------
+Notas finais:
+- Sempre rode "zero checksum <pkg>" após adicionar/atualizar o sources.
+- Use "zero revdep check" após um "zero world" para validar libs.
+- "--force" deve ser usado com cautela (conflitos ou remoções inseguras).
